@@ -70,18 +70,18 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    # Version 1 architecture controls (all off by default to preserve baseline behavior).
-    v1_enable_metadata = bool(int(os.environ.get("V1_ENABLE_METADATA", "0")))
-    v1_enable_local_path = bool(int(os.environ.get("V1_ENABLE_LOCAL_PATH", "0")))
-    v1_enable_spectral_path = bool(int(os.environ.get("V1_ENABLE_SPECTRAL_PATH", "0")))
-    v1_chunk_len = int(os.environ.get("V1_CHUNK_LEN", 0))
-    v1_chunk_overlap = int(os.environ.get("V1_CHUNK_OVERLAP", 0))
-    v1_fusion_mode = os.environ.get("V1_FUSION_MODE", "none")
-    v1_enable_coherence = bool(int(os.environ.get("V1_ENABLE_COHERENCE", "0")))
-    v1_coh_boundary = float(os.environ.get("V1_COH_BOUNDARY", 0.0))
-    v1_coh_partition = float(os.environ.get("V1_COH_PARTITION", 0.0))
-    v1_coh_recompose = float(os.environ.get("V1_COH_RECOMPOSE", 0.0))
-    v1_coh_local_global = float(os.environ.get("V1_COH_LOCAL_GLOBAL", 0.0))
+    # Version 1 architecture controls (defaults set to V1-on for local experimentation).
+    v1_enable_metadata = bool(int(os.environ.get("V1_ENABLE_METADATA", "1")))
+    v1_enable_local_path = bool(int(os.environ.get("V1_ENABLE_LOCAL_PATH", "1")))
+    v1_enable_spectral_path = bool(int(os.environ.get("V1_ENABLE_SPECTRAL_PATH", "1")))
+    v1_chunk_len = int(os.environ.get("V1_CHUNK_LEN", 256))
+    v1_chunk_overlap = int(os.environ.get("V1_CHUNK_OVERLAP", 64))
+    v1_fusion_mode = os.environ.get("V1_FUSION_MODE", "gated")
+    v1_enable_coherence = bool(int(os.environ.get("V1_ENABLE_COHERENCE", "1")))
+    v1_coh_boundary = float(os.environ.get("V1_COH_BOUNDARY", 0.02))
+    v1_coh_partition = float(os.environ.get("V1_COH_PARTITION", 0.01))
+    v1_coh_recompose = float(os.environ.get("V1_COH_RECOMPOSE", 0.01))
+    v1_coh_local_global = float(os.environ.get("V1_COH_LOCAL_GLOBAL", 0.01))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -779,16 +779,13 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        if self.num_kv_heads != self.num_heads:
-            kv_repeat = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(kv_repeat, dim=1)
-            v = v.repeat_interleave(kv_repeat, dim=1)
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
             attn_mask=None,
             is_causal=True,
+            enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
