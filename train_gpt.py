@@ -77,11 +77,6 @@ class Hyperparameters:
     v1_chunk_len = int(os.environ.get("V1_CHUNK_LEN", 128))
     v1_chunk_overlap = int(os.environ.get("V1_CHUNK_OVERLAP", 32))
     v1_fusion_mode = os.environ.get("V1_FUSION_MODE", "none")
-    v1_enable_coherence = bool(int(os.environ.get("V1_ENABLE_COHERENCE", "0")))
-    v1_coh_boundary = float(os.environ.get("V1_COH_BOUNDARY", 0.02))
-    v1_coh_partition = float(os.environ.get("V1_COH_PARTITION", 0.01))
-    v1_coh_recompose = float(os.environ.get("V1_COH_RECOMPOSE", 0.01))
-    v1_coh_local_global = float(os.environ.get("V1_COH_LOCAL_GLOBAL", 0.01))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -814,13 +809,10 @@ class LocalFeatureEncoder(nn.Module):
         super().__init__()
         self.cue_proj = CastedLinear(5, dim, bias=False)
         self.cue_gate = CastedLinear(dim, dim, bias=False)
-        self.cue_head = CastedLinear(dim, 4, bias=True)
 
-    def forward(self, x: Tensor, sequence_metadata: dict[str, Tensor] | None) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, sequence_metadata: dict[str, Tensor] | None) -> Tensor:
         if sequence_metadata is None:
-            local_state = x
-            local_logits = torch.zeros((x.size(0), x.size(1), 4), dtype=x.dtype, device=x.device)
-            return local_state, local_logits
+            return x
 
         position_ids = sequence_metadata["position_ids"].to(device=x.device)
         boundary_flags = sequence_metadata["boundary_flags"].to(device=x.device)
@@ -843,8 +835,7 @@ class LocalFeatureEncoder(nn.Module):
         cue_state = self.cue_proj(cues)
         gate = torch.sigmoid(self.cue_gate(cue_state))
         local_state = x + gate * cue_state
-        local_logits = self.cue_head(local_state)
-        return local_state, local_logits
+        return local_state
 
 
 class SpectralRelationalEncoder(nn.Module):
@@ -854,11 +845,10 @@ class SpectralRelationalEncoder(nn.Module):
         self.chunk_proj = CastedLinear(3, dim, bias=False)
         self.mix_gate = CastedLinear(dim, 1, bias=True)
 
-    def forward(self, local_state: Tensor, chunk_metadata: dict[str, Tensor] | None) -> tuple[Tensor, Tensor]:
+    def forward(self, local_state: Tensor, chunk_metadata: dict[str, Tensor] | None) -> Tensor:
         bsz, seqlen, _ = local_state.shape
         if chunk_metadata is None:
-            mix = torch.zeros((bsz, seqlen), dtype=local_state.dtype, device=local_state.device)
-            return local_state, mix
+            return local_state
 
         chunk_count = max(int(chunk_metadata["chunk_index"].numel()), 1)
         chunk_starts = chunk_metadata["chunk_start"].to(device=local_state.device, dtype=local_state.dtype)
@@ -874,7 +864,7 @@ class SpectralRelationalEncoder(nn.Module):
 
         mix = torch.sigmoid(self.mix_gate(local_state + chunk_context)).squeeze(-1)
         spectral_state = local_state + mix.unsqueeze(-1) * chunk_context
-        return spectral_state, mix
+        return spectral_state
 
 
 class Block(nn.Module):
@@ -922,10 +912,6 @@ class GPT(nn.Module):
         v1_enable_local_path: bool,
         v1_enable_spectral_path: bool,
         v1_fusion_mode: str,
-        v1_coh_boundary_active: bool,
-        v1_coh_partition_active: bool,
-        v1_coh_recompose_active: bool,
-        v1_coh_local_global_active: bool,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -936,10 +922,6 @@ class GPT(nn.Module):
         self.v1_enable_local_path = bool(v1_enable_local_path)
         self.v1_enable_spectral_path = bool(v1_enable_spectral_path)
         self.v1_fusion_mode = str(v1_fusion_mode).lower()
-        self.v1_coh_boundary_active = bool(v1_coh_boundary_active)
-        self.v1_coh_partition_active = bool(v1_coh_partition_active)
-        self.v1_coh_recompose_active = bool(v1_coh_recompose_active)
-        self.v1_coh_local_global_active = bool(v1_coh_local_global_active)
         self.v1_fusion_uses_local = self.v1_fusion_mode in {"local_add", "recompose", "mean", "gated"}
         self.v1_fusion_uses_spectral = self.v1_fusion_mode in {"spectral_add", "recompose", "mean", "gated"}
         self.v1_fusion_uses_recompose = self.v1_fusion_mode in {"recompose", "mean", "gated"}
@@ -984,8 +966,7 @@ class GPT(nn.Module):
         target_ids: Tensor,
         sequence_metadata: dict[str, Tensor] | None = None,
         chunk_metadata: dict[str, Tensor] | None = None,
-        return_aux: bool = False,
-    ) -> Tensor | tuple[Tensor, dict[str, Tensor]]:
+    ) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1000,28 +981,21 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        need_boundary_aux = return_aux and self.v1_coh_boundary_active
-        need_partition_aux = return_aux and self.v1_coh_partition_active
-        need_recompose_aux = return_aux and self.v1_coh_recompose_active
-        need_local_global_aux = return_aux and self.v1_coh_local_global_active
-
-        need_local_path = self.v1_enable_local_path or self.v1_fusion_uses_local or need_boundary_aux or need_local_global_aux
+        need_local_path = self.v1_enable_local_path or self.v1_fusion_uses_local
         if need_local_path:
-            local_encoded, local_feature_logits = self.local_feature_encoder(x, sequence_metadata)
+            local_encoded = self.local_feature_encoder(x, sequence_metadata)
             local_state = local_encoded if self.v1_enable_local_path else x
         else:
             local_state = x
-            local_feature_logits = None
 
-        need_spectral_path = self.v1_enable_spectral_path or self.v1_fusion_uses_spectral or need_partition_aux or need_local_global_aux
+        need_spectral_path = self.v1_enable_spectral_path or self.v1_fusion_uses_spectral
         if need_spectral_path:
-            spectral_encoded, spectral_mix = self.spectral_relational_encoder(local_state, chunk_metadata)
+            spectral_encoded = self.spectral_relational_encoder(local_state, chunk_metadata)
             spectral_state = spectral_encoded if self.v1_enable_spectral_path else local_state
         else:
             spectral_state = local_state
-            spectral_mix = None
 
-        need_recomposition = self.v1_fusion_uses_recompose or need_recompose_aux
+        need_recomposition = self.v1_fusion_uses_recompose
         if need_recomposition:
             recompose_input = torch.cat((local_state, spectral_state), dim=-1)
             recomposition_state = self.recompose_proj(recompose_input)
@@ -1059,27 +1033,7 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         pred_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-
-        if not return_aux:
-            return pred_loss
-
-        aux: dict[str, Tensor] = {"fusion_state": fusion_state}
-        if need_boundary_aux:
-            if local_feature_logits is None:
-                raise RuntimeError("local_feature_logits required for boundary coherence")
-            aux["local_feature_logits"] = local_feature_logits
-        if need_partition_aux:
-            if spectral_mix is None:
-                raise RuntimeError("spectral_mix required for partition coherence")
-            aux["spectral_mix"] = spectral_mix
-        if need_recompose_aux:
-            if recomposition_state is None:
-                raise RuntimeError("recomposition_state required for recompose coherence")
-            aux["recomposition_state"] = recomposition_state
-        if need_local_global_aux:
-            aux["local_state"] = local_state
-            aux["spectral_state"] = spectral_state
-        return pred_loss, aux
+        return pred_loss
 
 
 # -----------------------------
@@ -1179,27 +1133,13 @@ def main() -> None:
     fusion_mode = args.v1_fusion_mode.lower()
     fusion_uses_local = fusion_mode in {"local_add", "recompose", "mean", "gated"}
     fusion_uses_spectral = fusion_mode in {"spectral_add", "recompose", "mean", "gated"}
-    coh_boundary_active = args.v1_enable_coherence and args.v1_coh_boundary > 0.0
-    coh_partition_active = args.v1_enable_coherence and args.v1_coh_partition > 0.0
-    coh_recompose_active = args.v1_enable_coherence and args.v1_coh_recompose > 0.0
-    coh_local_global_active = args.v1_enable_coherence and args.v1_coh_local_global > 0.0
-    v1_coherence_active = (
-        coh_boundary_active
-        or coh_partition_active
-        or coh_recompose_active
-        or coh_local_global_active
-    )
     need_sequence_metadata = args.v1_enable_metadata and (
         args.v1_enable_local_path
         or fusion_uses_local
-        or coh_boundary_active
-        or coh_local_global_active
     )
     need_chunk_metadata = args.v1_enable_metadata and (
         args.v1_enable_spectral_path
         or fusion_uses_spectral
-        or coh_partition_active
-        or coh_local_global_active
     )
 
     metadata_builder = None
@@ -1233,10 +1173,6 @@ def main() -> None:
         v1_enable_local_path=args.v1_enable_local_path,
         v1_enable_spectral_path=args.v1_enable_spectral_path,
         v1_fusion_mode=args.v1_fusion_mode,
-        v1_coh_boundary_active=coh_boundary_active,
-        v1_coh_partition_active=coh_partition_active,
-        v1_coh_recompose_active=coh_recompose_active,
-        v1_coh_local_global_active=coh_local_global_active,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1314,16 +1250,11 @@ def main() -> None:
         f"enabled_spectral_path:{args.v1_enable_spectral_path} fusion_mode:{args.v1_fusion_mode}"
     )
     log0(
-        f"v1:chunk_len:{args.v1_chunk_len} chunk_overlap:{args.v1_chunk_overlap} "
-        f"coherence_enabled:{args.v1_enable_coherence}"
+        f"v1:chunk_len:{args.v1_chunk_len} chunk_overlap:{args.v1_chunk_overlap}"
     )
     log0(
         f"v1:runtime_paths need_sequence_metadata:{need_sequence_metadata} "
-        f"need_chunk_metadata:{need_chunk_metadata} coherence_active:{v1_coherence_active}"
-    )
-    log0(
-        f"v1:coherence_weights boundary:{args.v1_coh_boundary:.6f} partition:{args.v1_coh_partition:.6f} "
-        f"recompose:{args.v1_coh_recompose:.6f} local_global:{args.v1_coh_local_global:.6f}"
+        f"need_chunk_metadata:{need_chunk_metadata}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1346,55 +1277,6 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
-
-    def compute_total_loss(
-        pred_loss: Tensor,
-        aux: dict[str, Tensor] | None,
-        sequence_metadata: dict[str, Tensor] | None,
-        chunk_metadata: dict[str, Tensor] | None,
-    ) -> tuple[Tensor, dict[str, Tensor]]:
-        zero = pred_loss.new_zeros(())
-        coherence = {
-            "boundary": zero,
-            "partition": zero,
-            "recompose": zero,
-            "local_global": zero,
-        }
-        if not v1_coherence_active or aux is None:
-            return pred_loss, coherence
-
-        if coh_boundary_active:
-            if sequence_metadata is None:
-                raise RuntimeError("sequence_metadata required for boundary coherence")
-            boundary_target = sequence_metadata["boundary_flags"].to(dtype=pred_loss.dtype)
-            boundary_logits = aux["local_feature_logits"][..., 0].to(dtype=pred_loss.dtype)
-            coherence["boundary"] = F.binary_cross_entropy_with_logits(boundary_logits, boundary_target)
-
-        if coh_partition_active:
-            if chunk_metadata is None:
-                raise RuntimeError("chunk_metadata required for partition coherence")
-            chunk_count = max(int(chunk_metadata["chunk_index"].numel()), 1)
-            partition_target = pred_loss.new_tensor(1.0 / float(chunk_count))
-            spectral_mix_mean = aux["spectral_mix"].to(dtype=pred_loss.dtype).mean()
-            coherence["partition"] = (spectral_mix_mean - partition_target).square()
-
-        if coh_recompose_active:
-            coherence["recompose"] = F.mse_loss(
-                aux["recomposition_state"].to(dtype=pred_loss.dtype),
-                aux["fusion_state"].to(dtype=pred_loss.dtype),
-            )
-
-        if coh_local_global_active:
-            local_global_local = aux["local_state"].to(dtype=pred_loss.dtype).mean(dim=1)
-            local_global_spectral = aux["spectral_state"].to(dtype=pred_loss.dtype).mean(dim=1)
-            coherence["local_global"] = F.mse_loss(local_global_local, local_global_spectral)
-
-        total = pred_loss
-        total = total + args.v1_coh_boundary * coherence["boundary"]
-        total = total + args.v1_coh_partition * coherence["partition"]
-        total = total + args.v1_coh_recompose * coherence["recompose"]
-        total = total + args.v1_coh_local_global * coherence["local_global"]
-        return total, coherence
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1432,23 +1314,11 @@ def main() -> None:
                 else:
                     sequence_metadata = None
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    model_out = model(
+                    warmup_loss = model(
                         x,
                         y,
                         sequence_metadata=sequence_metadata,
                         chunk_metadata=chunk_metadata,
-                        return_aux=v1_coherence_active,
-                    )
-                    if v1_coherence_active:
-                        warmup_pred_loss, warmup_aux = model_out
-                    else:
-                        warmup_pred_loss = model_out
-                        warmup_aux = None
-                    warmup_loss, _ = compute_total_loss(
-                        warmup_pred_loss,
-                        warmup_aux,
-                        sequence_metadata,
-                        chunk_metadata,
                     )
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1520,11 +1390,6 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
-        train_pred_loss = torch.zeros((), device=device)
-        coh_boundary_loss = torch.zeros((), device=device)
-        coh_partition_loss = torch.zeros((), device=device)
-        coh_recompose_loss = torch.zeros((), device=device)
-        coh_local_global_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1542,32 +1407,15 @@ def main() -> None:
             else:
                 sequence_metadata = None
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                model_out = model(
+                loss = model(
                     x,
                     y,
                     sequence_metadata=sequence_metadata,
                     chunk_metadata=chunk_metadata,
-                    return_aux=v1_coherence_active,
                 )
-                if v1_coherence_active:
-                    pred_loss, aux = model_out
-                else:
-                    pred_loss = model_out
-                    aux = None
-                loss, coh = compute_total_loss(pred_loss, aux, sequence_metadata, chunk_metadata)
             train_loss += loss.detach()
-            train_pred_loss += pred_loss.detach()
-            coh_boundary_loss += coh["boundary"].detach()
-            coh_partition_loss += coh["partition"].detach()
-            coh_recompose_loss += coh["recompose"].detach()
-            coh_local_global_loss += coh["local_global"].detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
-        train_pred_loss /= grad_accum_steps
-        coh_boundary_loss /= grad_accum_steps
-        coh_partition_loss /= grad_accum_steps
-        coh_recompose_loss /= grad_accum_steps
-        coh_local_global_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1593,16 +1441,9 @@ def main() -> None:
         if should_log_train:
             msg = (
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"pred_loss:{train_pred_loss.item():.4f} "
+                f"pred_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
-            if v1_coherence_active:
-                msg += (
-                    f" coh_boundary:{coh_boundary_loss.item():.4f}"
-                    f" coh_partition:{coh_partition_loss.item():.4f}"
-                    f" coh_recompose:{coh_recompose_loss.item():.4f}"
-                    f" coh_local_global:{coh_local_global_loss.item():.4f}"
-                )
             log0(msg)
 
         # Needed to sync whether we've reached the wallclock cap.
