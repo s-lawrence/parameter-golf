@@ -72,11 +72,9 @@ class Hyperparameters:
 
     # Version 1 architecture controls (defaults set to reduced chunked-metadata scaffold).
     v1_enable_metadata = bool(int(os.environ.get("V1_ENABLE_METADATA", "1")))
-    v1_enable_local_path = bool(int(os.environ.get("V1_ENABLE_LOCAL_PATH", "0")))
-    v1_enable_spectral_path = bool(int(os.environ.get("V1_ENABLE_SPECTRAL_PATH", "0")))
     v1_chunk_len = int(os.environ.get("V1_CHUNK_LEN", 128))
     v1_chunk_overlap = int(os.environ.get("V1_CHUNK_OVERLAP", 32))
-    v1_fusion_mode = os.environ.get("V1_FUSION_MODE", "none")
+    v1_fusion_mode = os.environ.get("V1_FUSION_MODE", "chunk_add")
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -451,112 +449,6 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-class SequenceMetadataBuilder:
-    # Derives lightweight token-level metadata after tokenization. This keeps
-    # tokenization frozen while exposing local structural cues for downstream stages.
-    def __init__(self, token_text_by_id: dict[int, str] | None = None, bos_id: int = 1, eos_id: int = 2, pad_id: int = 0):
-        self.token_text_by_id = token_text_by_id or {}
-        self.bos_id = int(bos_id)
-        self.eos_id = int(eos_id)
-        self.pad_id = int(pad_id)
-        self._lookup_tables: dict[str, Tensor] = self._build_lookup_tables(self.token_text_by_id)
-        self._device_cache: dict[torch.device, dict[str, Tensor]] = {}
-
-    def _build_lookup_tables(self, token_text_by_id: dict[int, str]) -> dict[str, Tensor]:
-        if not token_text_by_id:
-            empty = torch.zeros((1,), dtype=torch.bool)
-            return {
-                "leading_space": empty,
-                "punct": empty,
-                "quote_bracket": empty,
-                "newline_format": empty,
-            }
-
-        max_id = max(int(token_id) for token_id in token_text_by_id.keys())
-        leading_space = torch.zeros((max_id + 1,), dtype=torch.bool)
-        punct = torch.zeros((max_id + 1,), dtype=torch.bool)
-        quote_bracket = torch.zeros((max_id + 1,), dtype=torch.bool)
-        newline_format = torch.zeros((max_id + 1,), dtype=torch.bool)
-
-        punct_chars = set(",.;:!?")
-        quote_bracket_chars = set("\"'`“”‘’()[]{}<>")
-        format_markers = ("\n", "\t", "```", "##", "#", "|", "*", "- ", "<0x0A>", "<0x09>")
-
-        for token_id, piece in token_text_by_id.items():
-            idx = int(token_id)
-            text = piece or ""
-            if text.startswith("▁"):
-                leading_space[idx] = True
-                text = text[1:]
-
-            if any(ch in punct_chars for ch in text):
-                punct[idx] = True
-            if any(ch in quote_bracket_chars for ch in text):
-                quote_bracket[idx] = True
-            if any(marker in text for marker in format_markers):
-                newline_format[idx] = True
-
-        return {
-            "leading_space": leading_space,
-            "punct": punct,
-            "quote_bracket": quote_bracket,
-            "newline_format": newline_format,
-        }
-
-    def _tables_for_device(self, device: torch.device) -> dict[str, Tensor]:
-        cached = self._device_cache.get(device)
-        if cached is not None:
-            return cached
-        moved = {name: table.to(device=device, non_blocking=True) for name, table in self._lookup_tables.items()}
-        self._device_cache[device] = moved
-        return moved
-
-    @staticmethod
-    def _index_bool_table(table: Tensor, token_ids: Tensor) -> Tensor:
-        if table.numel() == 0:
-            return torch.zeros_like(token_ids, dtype=torch.bool)
-        out = torch.zeros_like(token_ids, dtype=torch.bool)
-        max_id = table.numel() - 1
-        in_range = token_ids <= max_id
-        if in_range.any():
-            out[in_range] = table[token_ids[in_range].long()]
-        return out
-
-    def __call__(self, token_ids: Tensor) -> dict[str, Tensor]:
-        squeeze_batch = token_ids.ndim == 1
-        if token_ids.ndim == 1:
-            token_ids = token_ids.unsqueeze(0)
-        if token_ids.ndim != 2:
-            raise ValueError(f"token_ids must be [T] or [B, T], got shape={tuple(token_ids.shape)}")
-
-        batch, seqlen = token_ids.shape
-        device = token_ids.device
-        tables = self._tables_for_device(device)
-
-        position_ids = torch.arange(seqlen, device=device, dtype=torch.int64).unsqueeze(0).expand(batch, -1)
-        is_bos = token_ids.eq(self.bos_id)
-        is_eos = token_ids.eq(self.eos_id)
-        is_pad = token_ids.eq(self.pad_id)
-        punct_markers = self._index_bool_table(tables["punct"], token_ids)
-        quote_bracket_markers = self._index_bool_table(tables["quote_bracket"], token_ids)
-        newline_format_markers = self._index_bool_table(tables["newline_format"], token_ids)
-        leading_space = self._index_bool_table(tables["leading_space"], token_ids)
-
-        # Boundary flags mark likely local discontinuities and separators.
-        boundary_flags = is_bos | is_eos | is_pad | leading_space | punct_markers | newline_format_markers
-
-        metadata: dict[str, Tensor] = {
-            "position_ids": position_ids,
-            "boundary_flags": boundary_flags,
-            "punctuation_markers": punct_markers,
-            "quote_bracket_markers": quote_bracket_markers,
-            "newline_format_markers": newline_format_markers,
-        }
-        if squeeze_batch:
-            metadata = {name: value.squeeze(0) for name, value in metadata.items()}
-        return metadata
-
-
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
@@ -803,68 +695,32 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
-class LocalFeatureEncoder(nn.Module):
-    # Lightweight local-symbolic cue extractor that depends only on provided metadata.
-    def __init__(self, dim: int):
-        super().__init__()
-        self.cue_proj = CastedLinear(5, dim, bias=False)
-        self.cue_gate = CastedLinear(dim, dim, bias=False)
-
-    def forward(self, x: Tensor, sequence_metadata: dict[str, Tensor] | None) -> Tensor:
-        if sequence_metadata is None:
-            return x
-
-        position_ids = sequence_metadata["position_ids"].to(device=x.device)
-        boundary_flags = sequence_metadata["boundary_flags"].to(device=x.device)
-        punctuation = sequence_metadata["punctuation_markers"].to(device=x.device)
-        quote_bracket = sequence_metadata["quote_bracket_markers"].to(device=x.device)
-        newline_format = sequence_metadata["newline_format_markers"].to(device=x.device)
-
-        pos = position_ids.to(dtype=x.dtype)
-        pos = pos / max(float(x.size(1) - 1), 1.0)
-        cues = torch.stack(
-            (
-                boundary_flags.to(dtype=x.dtype),
-                punctuation.to(dtype=x.dtype),
-                quote_bracket.to(dtype=x.dtype),
-                newline_format.to(dtype=x.dtype),
-                pos,
-            ),
-            dim=-1,
-        )
-        cue_state = self.cue_proj(cues)
-        gate = torch.sigmoid(self.cue_gate(cue_state))
-        local_state = x + gate * cue_state
-        return local_state
-
-
-class SpectralRelationalEncoder(nn.Module):
-    # Minimal spectral-relational scaffold conditioned on chunk-level metadata.
+class ChunkMetadataScaffold(nn.Module):
+    # Reduced metadata-conditioned chunk scaffold used in the mainline path.
     def __init__(self, dim: int):
         super().__init__()
         self.chunk_proj = CastedLinear(3, dim, bias=False)
         self.mix_gate = CastedLinear(dim, 1, bias=True)
 
-    def forward(self, local_state: Tensor, chunk_metadata: dict[str, Tensor] | None) -> Tensor:
-        bsz, seqlen, _ = local_state.shape
+    def forward(self, x: Tensor, chunk_metadata: dict[str, Tensor] | None) -> Tensor:
+        bsz, seqlen, _ = x.shape
         if chunk_metadata is None:
-            return local_state
+            return x
 
         chunk_count = max(int(chunk_metadata["chunk_index"].numel()), 1)
-        chunk_starts = chunk_metadata["chunk_start"].to(device=local_state.device, dtype=local_state.dtype)
-        chunk_ends = chunk_metadata["chunk_end"].to(device=local_state.device, dtype=local_state.dtype)
-        overlap_left = chunk_metadata["overlap_left"].to(device=local_state.device, dtype=local_state.dtype)
-        overlap_right = chunk_metadata["overlap_right"].to(device=local_state.device, dtype=local_state.dtype)
+        chunk_starts = chunk_metadata["chunk_start"].to(device=x.device, dtype=x.dtype)
+        chunk_ends = chunk_metadata["chunk_end"].to(device=x.device, dtype=x.dtype)
+        overlap_left = chunk_metadata["overlap_left"].to(device=x.device, dtype=x.dtype)
+        overlap_right = chunk_metadata["overlap_right"].to(device=x.device, dtype=x.dtype)
 
         mean_span = (chunk_ends - chunk_starts).mean() / max(float(seqlen), 1.0)
         overlap_ratio = (overlap_left + overlap_right).mean() * 0.5
-        chunk_count_ratio = local_state.new_tensor(float(chunk_count) / max(float(seqlen), 1.0))
+        chunk_count_ratio = x.new_tensor(float(chunk_count) / max(float(seqlen), 1.0))
         meta_vec = torch.stack((chunk_count_ratio, mean_span, overlap_ratio), dim=0)
         chunk_context = self.chunk_proj(meta_vec[None, None, :]).expand(bsz, seqlen, -1)
 
-        mix = torch.sigmoid(self.mix_gate(local_state + chunk_context)).squeeze(-1)
-        spectral_state = local_state + mix.unsqueeze(-1) * chunk_context
-        return spectral_state
+        mix = torch.sigmoid(self.mix_gate(x + chunk_context)).squeeze(-1)
+        return x + mix.unsqueeze(-1) * chunk_context
 
 
 class Block(nn.Module):
@@ -909,8 +765,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        v1_enable_local_path: bool,
-        v1_enable_spectral_path: bool,
+        v1_enable_metadata: bool,
         v1_fusion_mode: str,
     ):
         super().__init__()
@@ -919,12 +774,12 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.v1_enable_local_path = bool(v1_enable_local_path)
-        self.v1_enable_spectral_path = bool(v1_enable_spectral_path)
+        self.v1_enable_metadata = bool(v1_enable_metadata)
         self.v1_fusion_mode = str(v1_fusion_mode).lower()
-        self.v1_fusion_uses_local = self.v1_fusion_mode in {"local_add", "recompose", "mean", "gated"}
-        self.v1_fusion_uses_spectral = self.v1_fusion_mode in {"spectral_add", "recompose", "mean", "gated"}
-        self.v1_fusion_uses_recompose = self.v1_fusion_mode in {"recompose", "mean", "gated"}
+        allowed_fusions = {"none", "chunk_add", "recompose", "mean", "gated"}
+        if self.v1_fusion_mode not in allowed_fusions:
+            raise ValueError(f"Unsupported V1_FUSION_MODE='{self.v1_fusion_mode}'. Allowed: {sorted(allowed_fusions)}")
+        self.need_recomposition = self.v1_fusion_mode in {"recompose", "mean", "gated"}
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -944,10 +799,9 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
-        self.local_feature_encoder = LocalFeatureEncoder(model_dim)
-        self.spectral_relational_encoder = SpectralRelationalEncoder(model_dim)
-        self.recompose_proj = CastedLinear(2 * model_dim, model_dim, bias=False)
-        self.fusion_gate = nn.Parameter(torch.zeros((model_dim,), dtype=torch.float32))
+        self.chunk_metadata_scaffold = ChunkMetadataScaffold(model_dim) if self.v1_enable_metadata else None
+        self.recompose_proj = CastedLinear(2 * model_dim, model_dim, bias=False) if self.need_recomposition else None
+        self.fusion_gate = nn.Parameter(torch.zeros((model_dim,), dtype=torch.float32)) if self.v1_fusion_mode == "gated" else None
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -964,7 +818,6 @@ class GPT(nn.Module):
         self,
         input_ids: Tensor,
         target_ids: Tensor,
-        sequence_metadata: dict[str, Tensor] | None = None,
         chunk_metadata: dict[str, Tensor] | None = None,
     ) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -981,32 +834,24 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        need_local_path = self.v1_enable_local_path or self.v1_fusion_uses_local
-        if need_local_path:
-            local_encoded = self.local_feature_encoder(x, sequence_metadata)
-            local_state = local_encoded if self.v1_enable_local_path else x
+        if self.v1_enable_metadata:
+            if self.chunk_metadata_scaffold is None:
+                raise RuntimeError("chunk_metadata_scaffold required when metadata is enabled")
+            chunk_state = self.chunk_metadata_scaffold(x, chunk_metadata)
         else:
-            local_state = x
+            chunk_state = x
 
-        need_spectral_path = self.v1_enable_spectral_path or self.v1_fusion_uses_spectral
-        if need_spectral_path:
-            spectral_encoded = self.spectral_relational_encoder(local_state, chunk_metadata)
-            spectral_state = spectral_encoded if self.v1_enable_spectral_path else local_state
-        else:
-            spectral_state = local_state
-
-        need_recomposition = self.v1_fusion_uses_recompose
-        if need_recomposition:
-            recompose_input = torch.cat((local_state, spectral_state), dim=-1)
+        if self.need_recomposition:
+            if self.recompose_proj is None:
+                raise RuntimeError("recompose_proj required for active recomposition path")
+            recompose_input = torch.cat((x, chunk_state), dim=-1)
             recomposition_state = self.recompose_proj(recompose_input)
         else:
             recomposition_state = None
 
         fusion_mode = self.v1_fusion_mode
-        if fusion_mode == "local_add":
-            fusion_state = x + local_state
-        elif fusion_mode == "spectral_add":
-            fusion_state = x + spectral_state
+        if fusion_mode == "chunk_add":
+            fusion_state = x + chunk_state
         elif fusion_mode == "recompose":
             if recomposition_state is None:
                 raise RuntimeError("recomposition_state required for fusion_mode='recompose'")
@@ -1018,6 +863,8 @@ class GPT(nn.Module):
         elif fusion_mode == "gated":
             if recomposition_state is None:
                 raise RuntimeError("recomposition_state required for fusion_mode='gated'")
+            if self.fusion_gate is None:
+                raise RuntimeError("fusion_gate required for fusion_mode='gated'")
             gate = torch.sigmoid(self.fusion_gate.to(dtype=x.dtype))[None, None, :]
             fusion_state = gate * x + (1.0 - gate) * recomposition_state
         else:
@@ -1127,29 +974,7 @@ def main() -> None:
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
-    token_text_by_id = {token_id: sp.id_to_piece(token_id) for token_id in range(int(sp.vocab_size()))}
-    bos_id = int(sp.bos_id()) if int(sp.bos_id()) >= 0 else 1
-    eos_id = int(sp.eos_id()) if int(sp.eos_id()) >= 0 else 2
-    fusion_mode = args.v1_fusion_mode.lower()
-    fusion_uses_local = fusion_mode in {"local_add", "recompose", "mean", "gated"}
-    fusion_uses_spectral = fusion_mode in {"spectral_add", "recompose", "mean", "gated"}
-    need_sequence_metadata = args.v1_enable_metadata and (
-        args.v1_enable_local_path
-        or fusion_uses_local
-    )
-    need_chunk_metadata = args.v1_enable_metadata and (
-        args.v1_enable_spectral_path
-        or fusion_uses_spectral
-    )
-
-    metadata_builder = None
-    if need_sequence_metadata:
-        metadata_builder = SequenceMetadataBuilder(
-            token_text_by_id=token_text_by_id,
-            bos_id=bos_id,
-            eos_id=eos_id,
-            pad_id=0,
-        )
+    need_chunk_metadata = args.v1_enable_metadata
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
@@ -1170,8 +995,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        v1_enable_local_path=args.v1_enable_local_path,
-        v1_enable_spectral_path=args.v1_enable_spectral_path,
+        v1_enable_metadata=args.v1_enable_metadata,
         v1_fusion_mode=args.v1_fusion_mode,
     ).to(device).bfloat16()
     for module in base_model.modules():
@@ -1246,16 +1070,12 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(
-        f"v1:enabled_metadata:{args.v1_enable_metadata} enabled_local_path:{args.v1_enable_local_path} "
-        f"enabled_spectral_path:{args.v1_enable_spectral_path} fusion_mode:{args.v1_fusion_mode}"
+        f"v1:enabled_metadata:{args.v1_enable_metadata} fusion_mode:{args.v1_fusion_mode}"
     )
     log0(
         f"v1:chunk_len:{args.v1_chunk_len} chunk_overlap:{args.v1_chunk_overlap}"
     )
-    log0(
-        f"v1:runtime_paths need_sequence_metadata:{need_sequence_metadata} "
-        f"need_chunk_metadata:{need_chunk_metadata}"
-    )
+    log0(f"v1:runtime_paths need_chunk_metadata:{need_chunk_metadata}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1307,17 +1127,10 @@ def main() -> None:
                 else:
                     x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                     chunk_metadata = None
-                if need_sequence_metadata:
-                    if metadata_builder is None:
-                        raise RuntimeError("metadata_builder required for sequence metadata path")
-                    sequence_metadata = metadata_builder(x)
-                else:
-                    sequence_metadata = None
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(
                         x,
                         y,
-                        sequence_metadata=sequence_metadata,
                         chunk_metadata=chunk_metadata,
                     )
                 (warmup_loss * grad_scale).backward()
@@ -1400,17 +1213,10 @@ def main() -> None:
             else:
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 chunk_metadata = None
-            if need_sequence_metadata:
-                if metadata_builder is None:
-                    raise RuntimeError("metadata_builder required for sequence metadata path")
-                sequence_metadata = metadata_builder(x)
-            else:
-                sequence_metadata = None
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(
                     x,
                     y,
-                    sequence_metadata=sequence_metadata,
                     chunk_metadata=chunk_metadata,
                 )
             train_loss += loss.detach()
