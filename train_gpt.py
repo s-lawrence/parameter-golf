@@ -70,6 +70,19 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
+    # Version 1 architecture controls (all off by default to preserve baseline behavior).
+    v1_enable_metadata = bool(int(os.environ.get("V1_ENABLE_METADATA", "0")))
+    v1_enable_local_path = bool(int(os.environ.get("V1_ENABLE_LOCAL_PATH", "0")))
+    v1_enable_spectral_path = bool(int(os.environ.get("V1_ENABLE_SPECTRAL_PATH", "0")))
+    v1_chunk_len = int(os.environ.get("V1_CHUNK_LEN", 0))
+    v1_chunk_overlap = int(os.environ.get("V1_CHUNK_OVERLAP", 0))
+    v1_fusion_mode = os.environ.get("V1_FUSION_MODE", "none")
+    v1_enable_coherence = bool(int(os.environ.get("V1_ENABLE_COHERENCE", "0")))
+    v1_coh_boundary = float(os.environ.get("V1_COH_BOUNDARY", 0.0))
+    v1_coh_partition = float(os.environ.get("V1_COH_PARTITION", 0.0))
+    v1_coh_recompose = float(os.environ.get("V1_COH_RECOMPOSE", 0.0))
+    v1_coh_local_global = float(os.environ.get("V1_COH_LOCAL_GLOBAL", 0.0))
+
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -443,6 +456,112 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
+class SequenceMetadataBuilder:
+    # Derives lightweight token-level metadata after tokenization. This keeps
+    # tokenization frozen while exposing local structural cues for downstream stages.
+    def __init__(self, token_text_by_id: dict[int, str] | None = None, bos_id: int = 1, eos_id: int = 2, pad_id: int = 0):
+        self.token_text_by_id = token_text_by_id or {}
+        self.bos_id = int(bos_id)
+        self.eos_id = int(eos_id)
+        self.pad_id = int(pad_id)
+        self._lookup_tables: dict[str, Tensor] = self._build_lookup_tables(self.token_text_by_id)
+        self._device_cache: dict[torch.device, dict[str, Tensor]] = {}
+
+    def _build_lookup_tables(self, token_text_by_id: dict[int, str]) -> dict[str, Tensor]:
+        if not token_text_by_id:
+            empty = torch.zeros((1,), dtype=torch.bool)
+            return {
+                "leading_space": empty,
+                "punct": empty,
+                "quote_bracket": empty,
+                "newline_format": empty,
+            }
+
+        max_id = max(int(token_id) for token_id in token_text_by_id.keys())
+        leading_space = torch.zeros((max_id + 1,), dtype=torch.bool)
+        punct = torch.zeros((max_id + 1,), dtype=torch.bool)
+        quote_bracket = torch.zeros((max_id + 1,), dtype=torch.bool)
+        newline_format = torch.zeros((max_id + 1,), dtype=torch.bool)
+
+        punct_chars = set(",.;:!?")
+        quote_bracket_chars = set("\"'`“”‘’()[]{}<>")
+        format_markers = ("\n", "\t", "```", "##", "#", "|", "*", "- ", "<0x0A>", "<0x09>")
+
+        for token_id, piece in token_text_by_id.items():
+            idx = int(token_id)
+            text = piece or ""
+            if text.startswith("▁"):
+                leading_space[idx] = True
+                text = text[1:]
+
+            if any(ch in punct_chars for ch in text):
+                punct[idx] = True
+            if any(ch in quote_bracket_chars for ch in text):
+                quote_bracket[idx] = True
+            if any(marker in text for marker in format_markers):
+                newline_format[idx] = True
+
+        return {
+            "leading_space": leading_space,
+            "punct": punct,
+            "quote_bracket": quote_bracket,
+            "newline_format": newline_format,
+        }
+
+    def _tables_for_device(self, device: torch.device) -> dict[str, Tensor]:
+        cached = self._device_cache.get(device)
+        if cached is not None:
+            return cached
+        moved = {name: table.to(device=device, non_blocking=True) for name, table in self._lookup_tables.items()}
+        self._device_cache[device] = moved
+        return moved
+
+    @staticmethod
+    def _index_bool_table(table: Tensor, token_ids: Tensor) -> Tensor:
+        if table.numel() == 0:
+            return torch.zeros_like(token_ids, dtype=torch.bool)
+        out = torch.zeros_like(token_ids, dtype=torch.bool)
+        max_id = table.numel() - 1
+        in_range = token_ids <= max_id
+        if in_range.any():
+            out[in_range] = table[token_ids[in_range].long()]
+        return out
+
+    def __call__(self, token_ids: Tensor) -> dict[str, Tensor]:
+        squeeze_batch = token_ids.ndim == 1
+        if token_ids.ndim == 1:
+            token_ids = token_ids.unsqueeze(0)
+        if token_ids.ndim != 2:
+            raise ValueError(f"token_ids must be [T] or [B, T], got shape={tuple(token_ids.shape)}")
+
+        batch, seqlen = token_ids.shape
+        device = token_ids.device
+        tables = self._tables_for_device(device)
+
+        position_ids = torch.arange(seqlen, device=device, dtype=torch.int64).unsqueeze(0).expand(batch, -1)
+        is_bos = token_ids.eq(self.bos_id)
+        is_eos = token_ids.eq(self.eos_id)
+        is_pad = token_ids.eq(self.pad_id)
+        punct_markers = self._index_bool_table(tables["punct"], token_ids)
+        quote_bracket_markers = self._index_bool_table(tables["quote_bracket"], token_ids)
+        newline_format_markers = self._index_bool_table(tables["newline_format"], token_ids)
+        leading_space = self._index_bool_table(tables["leading_space"], token_ids)
+
+        # Boundary flags mark likely local discontinuities and separators.
+        boundary_flags = is_bos | is_eos | is_pad | leading_space | punct_markers | newline_format_markers
+
+        metadata: dict[str, Tensor] = {
+            "position_ids": position_ids,
+            "boundary_flags": boundary_flags,
+            "punctuation_markers": punct_markers,
+            "quote_bracket_markers": quote_bracket_markers,
+            "newline_format_markers": newline_format_markers,
+        }
+        if squeeze_batch:
+            metadata = {name: value.squeeze(0) for name, value in metadata.items()}
+        return metadata
+
+
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
@@ -474,16 +593,80 @@ class TokenStream:
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
 
+class ChunkPartitioner:
+    # Partitions a per-rank token span into chunk windows with optional overlap.
+    def __init__(self, chunk_len: int = 0, chunk_overlap: int = 0):
+        self.chunk_len = int(chunk_len)
+        self.chunk_overlap = int(chunk_overlap)
+
+    def partition(self, token_count: int, device: torch.device) -> dict[str, Tensor]:
+        if token_count <= 0:
+            raise ValueError(f"token_count must be positive, got {token_count}")
+
+        # Baseline-compatible default: one chunk covering the full local span.
+        if self.chunk_len <= 0 or self.chunk_len >= token_count:
+            starts = torch.tensor([0], device=device, dtype=torch.int64)
+            ends = torch.tensor([token_count], device=device, dtype=torch.int64)
+            overlap_left = torch.tensor([False], device=device, dtype=torch.bool)
+            overlap_right = torch.tensor([False], device=device, dtype=torch.bool)
+            return {
+                "chunk_index": torch.tensor([0], device=device, dtype=torch.int64),
+                "chunk_start": starts,
+                "chunk_end": ends,
+                "overlap_left": overlap_left,
+                "overlap_right": overlap_right,
+            }
+
+        overlap = min(max(self.chunk_overlap, 0), self.chunk_len - 1)
+        stride = max(self.chunk_len - overlap, 1)
+        starts_list: list[int] = []
+        ends_list: list[int] = []
+        start = 0
+        while True:
+            end = min(start + self.chunk_len, token_count)
+            starts_list.append(start)
+            ends_list.append(end)
+            if end >= token_count:
+                break
+            start += stride
+
+        starts = torch.tensor(starts_list, device=device, dtype=torch.int64)
+        ends = torch.tensor(ends_list, device=device, dtype=torch.int64)
+        overlap_left = starts > 0
+        overlap_right = ends < token_count
+        chunk_count = starts.numel()
+        return {
+            "chunk_index": torch.arange(chunk_count, device=device, dtype=torch.int64),
+            "chunk_start": starts,
+            "chunk_end": ends,
+            "overlap_left": overlap_left,
+            "overlap_right": overlap_right,
+        }
+
+
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+    def __init__(
+        self,
+        pattern: str,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        chunk_len: int = 0,
+        chunk_overlap: int = 0,
+        enable_metadata: bool = False,
+    ):
         self.rank = rank
         self.world_size = world_size
         self.device = device
         self.stream = TokenStream(pattern)
+        self.partitioner = ChunkPartitioner(chunk_len=chunk_len, chunk_overlap=chunk_overlap)
+        self.enable_metadata = bool(enable_metadata)
 
-    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+    def next_batch(
+        self, global_tokens: int, seq_len: int, grad_accum_steps: int
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, dict[str, Tensor]]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
         chunk = self.stream.take(per_rank_span * self.world_size)
@@ -491,7 +674,12 @@ class DistributedTokenLoader:
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
-        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+        x = x.to(self.device, non_blocking=True)
+        y = y.to(self.device, non_blocking=True)
+        if not self.enable_metadata:
+            return x, y
+        chunk_metadata = self.partitioner.partition(token_count=int(x.numel()), device=self.device)
+        return x, y, chunk_metadata
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -591,13 +779,16 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        if self.num_kv_heads != self.num_heads:
+            kv_repeat = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(kv_repeat, dim=1)
+            v = v.repeat_interleave(kv_repeat, dim=1)
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
             attn_mask=None,
             is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
@@ -615,6 +806,79 @@ class MLP(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
+
+
+class LocalFeatureEncoder(nn.Module):
+    # Lightweight local-symbolic cue extractor that depends only on provided metadata.
+    def __init__(self, dim: int):
+        super().__init__()
+        self.cue_proj = CastedLinear(5, dim, bias=False)
+        self.cue_gate = CastedLinear(dim, dim, bias=False)
+        self.cue_head = CastedLinear(dim, 4, bias=True)
+
+    def forward(self, x: Tensor, sequence_metadata: dict[str, Tensor] | None) -> tuple[Tensor, Tensor]:
+        if sequence_metadata is None:
+            local_state = x
+            local_logits = torch.zeros((x.size(0), x.size(1), 4), dtype=x.dtype, device=x.device)
+            return local_state, local_logits
+
+        position_ids = sequence_metadata["position_ids"].to(device=x.device)
+        boundary_flags = sequence_metadata["boundary_flags"].to(device=x.device)
+        punctuation = sequence_metadata["punctuation_markers"].to(device=x.device)
+        quote_bracket = sequence_metadata["quote_bracket_markers"].to(device=x.device)
+        newline_format = sequence_metadata["newline_format_markers"].to(device=x.device)
+
+        pos = position_ids.to(dtype=x.dtype)
+        pos = pos / max(float(x.size(1) - 1), 1.0)
+        cues = torch.stack(
+            (
+                boundary_flags.to(dtype=x.dtype),
+                punctuation.to(dtype=x.dtype),
+                quote_bracket.to(dtype=x.dtype),
+                newline_format.to(dtype=x.dtype),
+                pos,
+            ),
+            dim=-1,
+        )
+        cue_state = self.cue_proj(cues)
+        gate = torch.sigmoid(self.cue_gate(cue_state))
+        local_state = x + gate * cue_state
+        local_logits = self.cue_head(local_state)
+        return local_state, local_logits
+
+
+class SpectralRelationalEncoder(nn.Module):
+    # Minimal spectral-relational scaffold conditioned on chunk-level metadata.
+    def __init__(self, dim: int):
+        super().__init__()
+        self.chunk_proj = CastedLinear(3, dim, bias=False)
+        self.mix_gate = CastedLinear(dim, 1, bias=True)
+
+    def forward(self, local_state: Tensor, chunk_metadata: dict[str, Tensor] | None) -> tuple[Tensor, Tensor]:
+        bsz, seqlen, _ = local_state.shape
+        if chunk_metadata is None:
+            mix = torch.zeros((bsz, seqlen), dtype=local_state.dtype, device=local_state.device)
+            return local_state, mix
+
+        chunk_count = max(int(chunk_metadata["chunk_index"].numel()), 1)
+        chunk_starts = chunk_metadata["chunk_start"].to(device=local_state.device, dtype=local_state.dtype)
+        chunk_ends = chunk_metadata["chunk_end"].to(device=local_state.device, dtype=local_state.dtype)
+        overlap_left = chunk_metadata["overlap_left"].to(device=local_state.device, dtype=local_state.dtype)
+        overlap_right = chunk_metadata["overlap_right"].to(device=local_state.device, dtype=local_state.dtype)
+
+        mean_span = (chunk_ends - chunk_starts).mean() / max(float(seqlen), 1.0)
+        overlap_ratio = (overlap_left + overlap_right).mean() * 0.5
+        meta_vec = torch.tensor(
+            [float(chunk_count), float(mean_span.item()), float(overlap_ratio.item())],
+            device=local_state.device,
+            dtype=local_state.dtype,
+        )
+        meta_vec[0] = meta_vec[0] / max(float(seqlen), 1.0)
+        chunk_context = self.chunk_proj(meta_vec[None, None, :]).expand(bsz, seqlen, -1)
+
+        mix = torch.sigmoid(self.mix_gate(local_state + chunk_context)).squeeze(-1)
+        spectral_state = local_state + mix.unsqueeze(-1) * chunk_context
+        return spectral_state, mix
 
 
 class Block(nn.Module):
@@ -659,6 +923,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        v1_enable_local_path: bool,
+        v1_enable_spectral_path: bool,
+        v1_fusion_mode: str,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,6 +933,9 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.v1_enable_local_path = bool(v1_enable_local_path)
+        self.v1_enable_spectral_path = bool(v1_enable_spectral_path)
+        self.v1_fusion_mode = str(v1_fusion_mode).lower()
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -685,6 +955,10 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
+        self.local_feature_encoder = LocalFeatureEncoder(model_dim)
+        self.spectral_relational_encoder = SpectralRelationalEncoder(model_dim)
+        self.recompose_proj = CastedLinear(2 * model_dim, model_dim, bias=False)
+        self.fusion_gate = nn.Parameter(torch.zeros((model_dim,), dtype=torch.float32))
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -697,7 +971,14 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        sequence_metadata: dict[str, Tensor] | None = None,
+        chunk_metadata: dict[str, Tensor] | None = None,
+        return_aux: bool = False,
+    ) -> Tensor | tuple[Tensor, dict[str, Tensor]]:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -712,7 +993,31 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        local_encoded, local_feature_logits = self.local_feature_encoder(x, sequence_metadata)
+        local_state = local_encoded if self.v1_enable_local_path else x
+
+        spectral_encoded, spectral_mix = self.spectral_relational_encoder(local_state, chunk_metadata)
+        spectral_state = spectral_encoded if self.v1_enable_spectral_path else local_state
+
+        recompose_input = torch.cat((local_state, spectral_state), dim=-1)
+        recomposition_state = self.recompose_proj(recompose_input)
+
+        fusion_mode = self.v1_fusion_mode
+        if fusion_mode == "local_add":
+            fusion_state = x + local_state
+        elif fusion_mode == "spectral_add":
+            fusion_state = x + spectral_state
+        elif fusion_mode == "recompose":
+            fusion_state = x + recomposition_state
+        elif fusion_mode == "mean":
+            fusion_state = 0.5 * (x + recomposition_state)
+        elif fusion_mode == "gated":
+            gate = torch.sigmoid(self.fusion_gate.to(dtype=x.dtype))[None, None, :]
+            fusion_state = gate * x + (1.0 - gate) * recomposition_state
+        else:
+            fusion_state = x
+
+        x = self.final_norm(fusion_state).reshape(-1, fusion_state.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -721,7 +1026,20 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        pred_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        if not return_aux:
+            return pred_loss
+
+        aux = {
+            "local_state": local_state,
+            "spectral_state": spectral_state,
+            "recomposition_state": recomposition_state,
+            "fusion_state": fusion_state,
+            "local_feature_logits": local_feature_logits,
+            "spectral_mix": spectral_mix,
+        }
+        return pred_loss, aux
 
 
 # -----------------------------
@@ -815,6 +1133,10 @@ def main() -> None:
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
+    token_text_by_id = {token_id: sp.id_to_piece(token_id) for token_id in range(int(sp.vocab_size()))}
+    bos_id = int(sp.bos_id()) if int(sp.bos_id()) >= 0 else 1
+    eos_id = int(sp.eos_id()) if int(sp.eos_id()) >= 0 else 2
+    metadata_builder = SequenceMetadataBuilder(token_text_by_id=token_text_by_id, bos_id=bos_id, eos_id=eos_id, pad_id=0)
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
@@ -835,6 +1157,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        v1_enable_local_path=args.v1_enable_local_path,
+        v1_enable_spectral_path=args.v1_enable_spectral_path,
+        v1_fusion_mode=args.v1_fusion_mode,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -907,19 +1232,86 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(
+        f"v1:enabled_metadata:{args.v1_enable_metadata} enabled_local_path:{args.v1_enable_local_path} "
+        f"enabled_spectral_path:{args.v1_enable_spectral_path} fusion_mode:{args.v1_fusion_mode}"
+    )
+    log0(
+        f"v1:chunk_len:{args.v1_chunk_len} chunk_overlap:{args.v1_chunk_overlap} "
+        f"coherence_enabled:{args.v1_enable_coherence}"
+    )
+    log0(
+        f"v1:coherence_weights boundary:{args.v1_coh_boundary:.6f} partition:{args.v1_coh_partition:.6f} "
+        f"recompose:{args.v1_coh_recompose:.6f} local_global:{args.v1_coh_local_global:.6f}"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_loader = DistributedTokenLoader(
+        args.train_files,
+        rank,
+        world_size,
+        device,
+        chunk_len=args.v1_chunk_len,
+        chunk_overlap=args.v1_chunk_overlap,
+        enable_metadata=args.v1_enable_metadata,
+    )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    v1_coherence_active = args.v1_enable_coherence and (
+        args.v1_coh_boundary > 0.0
+        or args.v1_coh_partition > 0.0
+        or args.v1_coh_recompose > 0.0
+        or args.v1_coh_local_global > 0.0
+    )
+
+    def compute_total_loss(
+        pred_loss: Tensor,
+        aux: dict[str, Tensor] | None,
+        sequence_metadata: dict[str, Tensor] | None,
+        chunk_metadata: dict[str, Tensor] | None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        zero = pred_loss.new_zeros(())
+        coherence = {
+            "boundary": zero,
+            "partition": zero,
+            "recompose": zero,
+            "local_global": zero,
+        }
+        if not v1_coherence_active or aux is None or sequence_metadata is None or chunk_metadata is None:
+            return pred_loss, coherence
+
+        boundary_target = sequence_metadata["boundary_flags"].to(dtype=pred_loss.dtype)
+        boundary_logits = aux["local_feature_logits"][..., 0].to(dtype=pred_loss.dtype)
+        coherence["boundary"] = F.binary_cross_entropy_with_logits(boundary_logits, boundary_target)
+
+        chunk_count = max(int(chunk_metadata["chunk_index"].numel()), 1)
+        partition_target = pred_loss.new_tensor(1.0 / float(chunk_count))
+        spectral_mix_mean = aux["spectral_mix"].to(dtype=pred_loss.dtype).mean()
+        coherence["partition"] = (spectral_mix_mean - partition_target).square()
+
+        coherence["recompose"] = F.mse_loss(
+            aux["recomposition_state"].to(dtype=pred_loss.dtype),
+            aux["fusion_state"].to(dtype=pred_loss.dtype),
+        )
+
+        local_global_local = aux["local_state"].to(dtype=pred_loss.dtype).mean(dim=1)
+        local_global_spectral = aux["spectral_state"].to(dtype=pred_loss.dtype).mean(dim=1)
+        coherence["local_global"] = F.mse_loss(local_global_local, local_global_spectral)
+
+        total = pred_loss
+        total = total + args.v1_coh_boundary * coherence["boundary"]
+        total = total + args.v1_coh_partition * coherence["partition"]
+        total = total + args.v1_coh_recompose * coherence["recompose"]
+        total = total + args.v1_coh_local_global * coherence["local_global"]
+        return total, coherence
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -943,9 +1335,37 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                if args.v1_enable_metadata:
+                    x, y, chunk_metadata = train_loader.next_batch(
+                        args.train_batch_tokens, args.train_seq_len, grad_accum_steps
+                    )
+                    sequence_metadata = metadata_builder(x)
+                else:
+                    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                    sequence_metadata = None
+                    chunk_metadata = None
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    if args.v1_enable_metadata:
+                        model_out = model(
+                            x,
+                            y,
+                            sequence_metadata=sequence_metadata,
+                            chunk_metadata=chunk_metadata,
+                            return_aux=v1_coherence_active,
+                        )
+                        if v1_coherence_active:
+                            warmup_pred_loss, warmup_aux = model_out
+                        else:
+                            warmup_pred_loss = model_out
+                            warmup_aux = None
+                        warmup_loss, _ = compute_total_loss(
+                            warmup_pred_loss,
+                            warmup_aux,
+                            sequence_metadata,
+                            chunk_metadata,
+                        )
+                    else:
+                        warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -958,7 +1378,15 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_loader = DistributedTokenLoader(
+            args.train_files,
+            rank,
+            world_size,
+            device,
+            chunk_len=args.v1_chunk_len,
+            chunk_overlap=args.v1_chunk_overlap,
+            enable_metadata=args.v1_enable_metadata,
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1008,15 +1436,60 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        train_pred_loss = torch.zeros((), device=device)
+        coh_boundary_loss = torch.zeros((), device=device)
+        coh_partition_loss = torch.zeros((), device=device)
+        coh_recompose_loss = torch.zeros((), device=device)
+        coh_local_global_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            if args.v1_enable_metadata:
+                x, y, chunk_metadata = train_loader.next_batch(
+                    args.train_batch_tokens, args.train_seq_len, grad_accum_steps
+                )
+                sequence_metadata = metadata_builder(x)
+            else:
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                sequence_metadata = None
+                chunk_metadata = None
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                if args.v1_enable_metadata:
+                    model_out = model(
+                        x,
+                        y,
+                        sequence_metadata=sequence_metadata,
+                        chunk_metadata=chunk_metadata,
+                        return_aux=v1_coherence_active,
+                    )
+                    if v1_coherence_active:
+                        pred_loss, aux = model_out
+                    else:
+                        pred_loss = model_out
+                        aux = None
+                    loss, coh = compute_total_loss(pred_loss, aux, sequence_metadata, chunk_metadata)
+                else:
+                    pred_loss = model(x, y)
+                    loss = pred_loss
+                    coh = {
+                        "boundary": pred_loss.new_zeros(()),
+                        "partition": pred_loss.new_zeros(()),
+                        "recompose": pred_loss.new_zeros(()),
+                        "local_global": pred_loss.new_zeros(()),
+                    }
             train_loss += loss.detach()
+            train_pred_loss += pred_loss.detach()
+            coh_boundary_loss += coh["boundary"].detach()
+            coh_partition_loss += coh["partition"].detach()
+            coh_recompose_loss += coh["recompose"].detach()
+            coh_local_global_loss += coh["local_global"].detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
+        train_pred_loss /= grad_accum_steps
+        coh_boundary_loss /= grad_accum_steps
+        coh_partition_loss /= grad_accum_steps
+        coh_recompose_loss /= grad_accum_steps
+        coh_local_global_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1040,10 +1513,19 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            log0(
+            msg = (
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"pred_loss:{train_pred_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if v1_coherence_active:
+                msg += (
+                    f" coh_boundary:{coh_boundary_loss.item():.4f}"
+                    f" coh_partition:{coh_partition_loss.item():.4f}"
+                    f" coh_recompose:{coh_recompose_loss.item():.4f}"
+                    f" coh_local_global:{coh_local_global_loss.item():.4f}"
+                )
+            log0(msg)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
