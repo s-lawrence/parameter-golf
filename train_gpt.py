@@ -70,14 +70,14 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    # Version 1 architecture controls (defaults set to V1-on for local experimentation).
+    # Version 1 architecture controls (defaults set to reduced chunked-metadata scaffold).
     v1_enable_metadata = bool(int(os.environ.get("V1_ENABLE_METADATA", "1")))
-    v1_enable_local_path = bool(int(os.environ.get("V1_ENABLE_LOCAL_PATH", "1")))
-    v1_enable_spectral_path = bool(int(os.environ.get("V1_ENABLE_SPECTRAL_PATH", "1")))
-    v1_chunk_len = int(os.environ.get("V1_CHUNK_LEN", 256))
-    v1_chunk_overlap = int(os.environ.get("V1_CHUNK_OVERLAP", 64))
-    v1_fusion_mode = os.environ.get("V1_FUSION_MODE", "gated")
-    v1_enable_coherence = bool(int(os.environ.get("V1_ENABLE_COHERENCE", "1")))
+    v1_enable_local_path = bool(int(os.environ.get("V1_ENABLE_LOCAL_PATH", "0")))
+    v1_enable_spectral_path = bool(int(os.environ.get("V1_ENABLE_SPECTRAL_PATH", "0")))
+    v1_chunk_len = int(os.environ.get("V1_CHUNK_LEN", 128))
+    v1_chunk_overlap = int(os.environ.get("V1_CHUNK_OVERLAP", 32))
+    v1_fusion_mode = os.environ.get("V1_FUSION_MODE", "none")
+    v1_enable_coherence = bool(int(os.environ.get("V1_ENABLE_COHERENCE", "0")))
     v1_coh_boundary = float(os.environ.get("V1_COH_BOUNDARY", 0.02))
     v1_coh_partition = float(os.environ.get("V1_COH_PARTITION", 0.01))
     v1_coh_recompose = float(os.environ.get("V1_COH_RECOMPOSE", 0.01))
@@ -655,14 +655,14 @@ class DistributedTokenLoader:
         device: torch.device,
         chunk_len: int = 0,
         chunk_overlap: int = 0,
-        enable_metadata: bool = False,
+        enable_chunk_metadata: bool = False,
     ):
         self.rank = rank
         self.world_size = world_size
         self.device = device
         self.stream = TokenStream(pattern)
         self.partitioner = ChunkPartitioner(chunk_len=chunk_len, chunk_overlap=chunk_overlap)
-        self.enable_metadata = bool(enable_metadata)
+        self.enable_chunk_metadata = bool(enable_chunk_metadata)
 
     def next_batch(
         self, global_tokens: int, seq_len: int, grad_accum_steps: int
@@ -676,7 +676,7 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
-        if not self.enable_metadata:
+        if not self.enable_chunk_metadata:
             return x, y
         chunk_metadata = self.partitioner.partition(token_count=int(x.numel()), device=self.device)
         return x, y, chunk_metadata
@@ -922,6 +922,10 @@ class GPT(nn.Module):
         v1_enable_local_path: bool,
         v1_enable_spectral_path: bool,
         v1_fusion_mode: str,
+        v1_coh_boundary_active: bool,
+        v1_coh_partition_active: bool,
+        v1_coh_recompose_active: bool,
+        v1_coh_local_global_active: bool,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -932,6 +936,13 @@ class GPT(nn.Module):
         self.v1_enable_local_path = bool(v1_enable_local_path)
         self.v1_enable_spectral_path = bool(v1_enable_spectral_path)
         self.v1_fusion_mode = str(v1_fusion_mode).lower()
+        self.v1_coh_boundary_active = bool(v1_coh_boundary_active)
+        self.v1_coh_partition_active = bool(v1_coh_partition_active)
+        self.v1_coh_recompose_active = bool(v1_coh_recompose_active)
+        self.v1_coh_local_global_active = bool(v1_coh_local_global_active)
+        self.v1_fusion_uses_local = self.v1_fusion_mode in {"local_add", "recompose", "mean", "gated"}
+        self.v1_fusion_uses_spectral = self.v1_fusion_mode in {"spectral_add", "recompose", "mean", "gated"}
+        self.v1_fusion_uses_recompose = self.v1_fusion_mode in {"recompose", "mean", "gated"}
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -989,14 +1000,33 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        local_encoded, local_feature_logits = self.local_feature_encoder(x, sequence_metadata)
-        local_state = local_encoded if self.v1_enable_local_path else x
+        need_boundary_aux = return_aux and self.v1_coh_boundary_active
+        need_partition_aux = return_aux and self.v1_coh_partition_active
+        need_recompose_aux = return_aux and self.v1_coh_recompose_active
+        need_local_global_aux = return_aux and self.v1_coh_local_global_active
 
-        spectral_encoded, spectral_mix = self.spectral_relational_encoder(local_state, chunk_metadata)
-        spectral_state = spectral_encoded if self.v1_enable_spectral_path else local_state
+        need_local_path = self.v1_enable_local_path or self.v1_fusion_uses_local or need_boundary_aux or need_local_global_aux
+        if need_local_path:
+            local_encoded, local_feature_logits = self.local_feature_encoder(x, sequence_metadata)
+            local_state = local_encoded if self.v1_enable_local_path else x
+        else:
+            local_state = x
+            local_feature_logits = None
 
-        recompose_input = torch.cat((local_state, spectral_state), dim=-1)
-        recomposition_state = self.recompose_proj(recompose_input)
+        need_spectral_path = self.v1_enable_spectral_path or self.v1_fusion_uses_spectral or need_partition_aux or need_local_global_aux
+        if need_spectral_path:
+            spectral_encoded, spectral_mix = self.spectral_relational_encoder(local_state, chunk_metadata)
+            spectral_state = spectral_encoded if self.v1_enable_spectral_path else local_state
+        else:
+            spectral_state = local_state
+            spectral_mix = None
+
+        need_recomposition = self.v1_fusion_uses_recompose or need_recompose_aux
+        if need_recomposition:
+            recompose_input = torch.cat((local_state, spectral_state), dim=-1)
+            recomposition_state = self.recompose_proj(recompose_input)
+        else:
+            recomposition_state = None
 
         fusion_mode = self.v1_fusion_mode
         if fusion_mode == "local_add":
@@ -1004,10 +1034,16 @@ class GPT(nn.Module):
         elif fusion_mode == "spectral_add":
             fusion_state = x + spectral_state
         elif fusion_mode == "recompose":
+            if recomposition_state is None:
+                raise RuntimeError("recomposition_state required for fusion_mode='recompose'")
             fusion_state = x + recomposition_state
         elif fusion_mode == "mean":
+            if recomposition_state is None:
+                raise RuntimeError("recomposition_state required for fusion_mode='mean'")
             fusion_state = 0.5 * (x + recomposition_state)
         elif fusion_mode == "gated":
+            if recomposition_state is None:
+                raise RuntimeError("recomposition_state required for fusion_mode='gated'")
             gate = torch.sigmoid(self.fusion_gate.to(dtype=x.dtype))[None, None, :]
             fusion_state = gate * x + (1.0 - gate) * recomposition_state
         else:
@@ -1027,14 +1063,22 @@ class GPT(nn.Module):
         if not return_aux:
             return pred_loss
 
-        aux = {
-            "local_state": local_state,
-            "spectral_state": spectral_state,
-            "recomposition_state": recomposition_state,
-            "fusion_state": fusion_state,
-            "local_feature_logits": local_feature_logits,
-            "spectral_mix": spectral_mix,
-        }
+        aux: dict[str, Tensor] = {"fusion_state": fusion_state}
+        if need_boundary_aux:
+            if local_feature_logits is None:
+                raise RuntimeError("local_feature_logits required for boundary coherence")
+            aux["local_feature_logits"] = local_feature_logits
+        if need_partition_aux:
+            if spectral_mix is None:
+                raise RuntimeError("spectral_mix required for partition coherence")
+            aux["spectral_mix"] = spectral_mix
+        if need_recompose_aux:
+            if recomposition_state is None:
+                raise RuntimeError("recomposition_state required for recompose coherence")
+            aux["recomposition_state"] = recomposition_state
+        if need_local_global_aux:
+            aux["local_state"] = local_state
+            aux["spectral_state"] = spectral_state
         return pred_loss, aux
 
 
@@ -1132,7 +1176,40 @@ def main() -> None:
     token_text_by_id = {token_id: sp.id_to_piece(token_id) for token_id in range(int(sp.vocab_size()))}
     bos_id = int(sp.bos_id()) if int(sp.bos_id()) >= 0 else 1
     eos_id = int(sp.eos_id()) if int(sp.eos_id()) >= 0 else 2
-    metadata_builder = SequenceMetadataBuilder(token_text_by_id=token_text_by_id, bos_id=bos_id, eos_id=eos_id, pad_id=0)
+    fusion_mode = args.v1_fusion_mode.lower()
+    fusion_uses_local = fusion_mode in {"local_add", "recompose", "mean", "gated"}
+    fusion_uses_spectral = fusion_mode in {"spectral_add", "recompose", "mean", "gated"}
+    coh_boundary_active = args.v1_enable_coherence and args.v1_coh_boundary > 0.0
+    coh_partition_active = args.v1_enable_coherence and args.v1_coh_partition > 0.0
+    coh_recompose_active = args.v1_enable_coherence and args.v1_coh_recompose > 0.0
+    coh_local_global_active = args.v1_enable_coherence and args.v1_coh_local_global > 0.0
+    v1_coherence_active = (
+        coh_boundary_active
+        or coh_partition_active
+        or coh_recompose_active
+        or coh_local_global_active
+    )
+    need_sequence_metadata = args.v1_enable_metadata and (
+        args.v1_enable_local_path
+        or fusion_uses_local
+        or coh_boundary_active
+        or coh_local_global_active
+    )
+    need_chunk_metadata = args.v1_enable_metadata and (
+        args.v1_enable_spectral_path
+        or fusion_uses_spectral
+        or coh_partition_active
+        or coh_local_global_active
+    )
+
+    metadata_builder = None
+    if need_sequence_metadata:
+        metadata_builder = SequenceMetadataBuilder(
+            token_text_by_id=token_text_by_id,
+            bos_id=bos_id,
+            eos_id=eos_id,
+            pad_id=0,
+        )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
@@ -1156,6 +1233,10 @@ def main() -> None:
         v1_enable_local_path=args.v1_enable_local_path,
         v1_enable_spectral_path=args.v1_enable_spectral_path,
         v1_fusion_mode=args.v1_fusion_mode,
+        v1_coh_boundary_active=coh_boundary_active,
+        v1_coh_partition_active=coh_partition_active,
+        v1_coh_recompose_active=coh_recompose_active,
+        v1_coh_local_global_active=coh_local_global_active,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1237,6 +1318,10 @@ def main() -> None:
         f"coherence_enabled:{args.v1_enable_coherence}"
     )
     log0(
+        f"v1:runtime_paths need_sequence_metadata:{need_sequence_metadata} "
+        f"need_chunk_metadata:{need_chunk_metadata} coherence_active:{v1_coherence_active}"
+    )
+    log0(
         f"v1:coherence_weights boundary:{args.v1_coh_boundary:.6f} partition:{args.v1_coh_partition:.6f} "
         f"recompose:{args.v1_coh_recompose:.6f} local_global:{args.v1_coh_local_global:.6f}"
     )
@@ -1253,7 +1338,7 @@ def main() -> None:
         device,
         chunk_len=args.v1_chunk_len,
         chunk_overlap=args.v1_chunk_overlap,
-        enable_metadata=args.v1_enable_metadata,
+        enable_chunk_metadata=need_chunk_metadata,
     )
 
     def zero_grad_all() -> None:
@@ -1261,12 +1346,6 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
-    v1_coherence_active = args.v1_enable_coherence and (
-        args.v1_coh_boundary > 0.0
-        or args.v1_coh_partition > 0.0
-        or args.v1_coh_recompose > 0.0
-        or args.v1_coh_local_global > 0.0
-    )
 
     def compute_total_loss(
         pred_loss: Tensor,
@@ -1281,26 +1360,34 @@ def main() -> None:
             "recompose": zero,
             "local_global": zero,
         }
-        if not v1_coherence_active or aux is None or sequence_metadata is None or chunk_metadata is None:
+        if not v1_coherence_active or aux is None:
             return pred_loss, coherence
 
-        boundary_target = sequence_metadata["boundary_flags"].to(dtype=pred_loss.dtype)
-        boundary_logits = aux["local_feature_logits"][..., 0].to(dtype=pred_loss.dtype)
-        coherence["boundary"] = F.binary_cross_entropy_with_logits(boundary_logits, boundary_target)
+        if coh_boundary_active:
+            if sequence_metadata is None:
+                raise RuntimeError("sequence_metadata required for boundary coherence")
+            boundary_target = sequence_metadata["boundary_flags"].to(dtype=pred_loss.dtype)
+            boundary_logits = aux["local_feature_logits"][..., 0].to(dtype=pred_loss.dtype)
+            coherence["boundary"] = F.binary_cross_entropy_with_logits(boundary_logits, boundary_target)
 
-        chunk_count = max(int(chunk_metadata["chunk_index"].numel()), 1)
-        partition_target = pred_loss.new_tensor(1.0 / float(chunk_count))
-        spectral_mix_mean = aux["spectral_mix"].to(dtype=pred_loss.dtype).mean()
-        coherence["partition"] = (spectral_mix_mean - partition_target).square()
+        if coh_partition_active:
+            if chunk_metadata is None:
+                raise RuntimeError("chunk_metadata required for partition coherence")
+            chunk_count = max(int(chunk_metadata["chunk_index"].numel()), 1)
+            partition_target = pred_loss.new_tensor(1.0 / float(chunk_count))
+            spectral_mix_mean = aux["spectral_mix"].to(dtype=pred_loss.dtype).mean()
+            coherence["partition"] = (spectral_mix_mean - partition_target).square()
 
-        coherence["recompose"] = F.mse_loss(
-            aux["recomposition_state"].to(dtype=pred_loss.dtype),
-            aux["fusion_state"].to(dtype=pred_loss.dtype),
-        )
+        if coh_recompose_active:
+            coherence["recompose"] = F.mse_loss(
+                aux["recomposition_state"].to(dtype=pred_loss.dtype),
+                aux["fusion_state"].to(dtype=pred_loss.dtype),
+            )
 
-        local_global_local = aux["local_state"].to(dtype=pred_loss.dtype).mean(dim=1)
-        local_global_spectral = aux["spectral_state"].to(dtype=pred_loss.dtype).mean(dim=1)
-        coherence["local_global"] = F.mse_loss(local_global_local, local_global_spectral)
+        if coh_local_global_active:
+            local_global_local = aux["local_state"].to(dtype=pred_loss.dtype).mean(dim=1)
+            local_global_spectral = aux["spectral_state"].to(dtype=pred_loss.dtype).mean(dim=1)
+            coherence["local_global"] = F.mse_loss(local_global_local, local_global_spectral)
 
         total = pred_loss
         total = total + args.v1_coh_boundary * coherence["boundary"]
@@ -1331,37 +1418,38 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                if args.v1_enable_metadata:
+                if need_chunk_metadata:
                     x, y, chunk_metadata = train_loader.next_batch(
                         args.train_batch_tokens, args.train_seq_len, grad_accum_steps
                     )
-                    sequence_metadata = metadata_builder(x)
                 else:
                     x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                    sequence_metadata = None
                     chunk_metadata = None
+                if need_sequence_metadata:
+                    if metadata_builder is None:
+                        raise RuntimeError("metadata_builder required for sequence metadata path")
+                    sequence_metadata = metadata_builder(x)
+                else:
+                    sequence_metadata = None
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    if args.v1_enable_metadata:
-                        model_out = model(
-                            x,
-                            y,
-                            sequence_metadata=sequence_metadata,
-                            chunk_metadata=chunk_metadata,
-                            return_aux=v1_coherence_active,
-                        )
-                        if v1_coherence_active:
-                            warmup_pred_loss, warmup_aux = model_out
-                        else:
-                            warmup_pred_loss = model_out
-                            warmup_aux = None
-                        warmup_loss, _ = compute_total_loss(
-                            warmup_pred_loss,
-                            warmup_aux,
-                            sequence_metadata,
-                            chunk_metadata,
-                        )
+                    model_out = model(
+                        x,
+                        y,
+                        sequence_metadata=sequence_metadata,
+                        chunk_metadata=chunk_metadata,
+                        return_aux=v1_coherence_active,
+                    )
+                    if v1_coherence_active:
+                        warmup_pred_loss, warmup_aux = model_out
                     else:
-                        warmup_loss = model(x, y)
+                        warmup_pred_loss = model_out
+                        warmup_aux = None
+                    warmup_loss, _ = compute_total_loss(
+                        warmup_pred_loss,
+                        warmup_aux,
+                        sequence_metadata,
+                        chunk_metadata,
+                    )
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1381,7 +1469,7 @@ def main() -> None:
             device,
             chunk_len=args.v1_chunk_len,
             chunk_overlap=args.v1_chunk_overlap,
-            enable_metadata=args.v1_enable_metadata,
+            enable_chunk_metadata=need_chunk_metadata,
         )
 
     # -----------------------------
@@ -1440,39 +1528,33 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            if args.v1_enable_metadata:
+            if need_chunk_metadata:
                 x, y, chunk_metadata = train_loader.next_batch(
                     args.train_batch_tokens, args.train_seq_len, grad_accum_steps
                 )
-                sequence_metadata = metadata_builder(x)
             else:
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                sequence_metadata = None
                 chunk_metadata = None
+            if need_sequence_metadata:
+                if metadata_builder is None:
+                    raise RuntimeError("metadata_builder required for sequence metadata path")
+                sequence_metadata = metadata_builder(x)
+            else:
+                sequence_metadata = None
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                if args.v1_enable_metadata:
-                    model_out = model(
-                        x,
-                        y,
-                        sequence_metadata=sequence_metadata,
-                        chunk_metadata=chunk_metadata,
-                        return_aux=v1_coherence_active,
-                    )
-                    if v1_coherence_active:
-                        pred_loss, aux = model_out
-                    else:
-                        pred_loss = model_out
-                        aux = None
-                    loss, coh = compute_total_loss(pred_loss, aux, sequence_metadata, chunk_metadata)
+                model_out = model(
+                    x,
+                    y,
+                    sequence_metadata=sequence_metadata,
+                    chunk_metadata=chunk_metadata,
+                    return_aux=v1_coherence_active,
+                )
+                if v1_coherence_active:
+                    pred_loss, aux = model_out
                 else:
-                    pred_loss = model(x, y)
-                    loss = pred_loss
-                    coh = {
-                        "boundary": pred_loss.new_zeros(()),
-                        "partition": pred_loss.new_zeros(()),
-                        "recompose": pred_loss.new_zeros(()),
-                        "local_global": pred_loss.new_zeros(()),
-                    }
+                    pred_loss = model_out
+                    aux = None
+                loss, coh = compute_total_loss(pred_loss, aux, sequence_metadata, chunk_metadata)
             train_loss += loss.detach()
             train_pred_loss += pred_loss.detach()
             coh_boundary_loss += coh["boundary"].detach()
