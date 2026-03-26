@@ -779,13 +779,16 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        if self.num_kv_heads != self.num_heads:
+            kv_repeat = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(kv_repeat, dim=1)
+            v = v.repeat_interleave(kv_repeat, dim=1)
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
             attn_mask=None,
             is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
@@ -865,12 +868,8 @@ class SpectralRelationalEncoder(nn.Module):
 
         mean_span = (chunk_ends - chunk_starts).mean() / max(float(seqlen), 1.0)
         overlap_ratio = (overlap_left + overlap_right).mean() * 0.5
-        meta_vec = torch.tensor(
-            [float(chunk_count), float(mean_span.item()), float(overlap_ratio.item())],
-            device=local_state.device,
-            dtype=local_state.dtype,
-        )
-        meta_vec[0] = meta_vec[0] / max(float(seqlen), 1.0)
+        chunk_count_ratio = local_state.new_tensor(float(chunk_count) / max(float(seqlen), 1.0))
+        meta_vec = torch.stack((chunk_count_ratio, mean_span, overlap_ratio), dim=0)
         chunk_context = self.chunk_proj(meta_vec[None, None, :]).expand(bsz, seqlen, -1)
 
         mix = torch.sigmoid(self.mix_gate(local_state + chunk_context)).squeeze(-1)
